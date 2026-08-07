@@ -406,6 +406,22 @@ wire [IF_COUNT*AXIS_IF_TX_ID_WIDTH-1:0]          axis_cons_tx_tid;
 wire [IF_COUNT*AXIS_IF_TX_DEST_WIDTH-1:0]        axis_cons_tx_tdest;
 wire [IF_COUNT*AXIS_IF_TX_USER_WIDTH-1:0]        axis_cons_tx_tuser;
 
+wire                            proposal_tail_slot_valid;
+wire [RAM_ADDR_WIDTH-1:0]       proposal_tail_slot_addr;
+wire [DMA_LEN_WIDTH-1:0]        proposal_tail_slot_len;
+
+wire proposal_tail_commit_valid;
+wire proposal_tail_commit_ready;
+
+// proposal -> tx_engine
+wire [RAM_SEG_COUNT*RAM_SEG_DATA_WIDTH-1:0]     proposal_buf_rd_data;
+wire [RAM_SEG_COUNT*RAM_SEG_BE_WIDTH-1:0]       proposal_buf_rd_be;
+wire                                            proposal_buf_rd_valid;
+wire                                            proposal_buf_rd_ready;
+wire                                            proposal_buf_tx_last;
+wire [DMA_LEN_WIDTH-1:0]                        proposal_buf_tx_len;
+wire                                            proposal_buf_empty;
+
 // --------------------------------------------------------------
 //                 Rx Modules
 // --------------------------------------------------------------
@@ -426,17 +442,34 @@ wire [P_LOG_ITEM_LEN-1:0] rx_round_id;
 
 wire                            rx_valid;
 
+assign reg_wr_ack_commit_queue = reg_wr_en_commit_queue; // acknowledge immediately, no wait states
+
+assign reg_rd_ack_commit_queue = reg_rd_en_commit_queue; // acknowledge immediately, no wait states
+assign reg_rd_data_commit_queue = 0; // no data to return for commit queue
+
+wire [RAM_SEG_COUNT*RAM_SEG_DATA_WIDTH-1:0]     commit_in_data;
+wire [RAM_SEG_COUNT*RAM_SEG_BE_WIDTH-1:0]       commit_in_be;
+wire                                            commit_in_valid;
+wire                                            commit_in_ready;
+wire                                            commit_in_last;
+
+wire                                            commit_head_slot_valid;
+wire [RAM_ADDR_WIDTH-1:0]                       commit_head_slot_addr;
+wire [DMA_LEN_WIDTH-1:0]                        commit_head_slot_len;
+
+wire                                            commit_head_slot_pop_valid;
+wire                                            commit_head_slot_pop_ready;
+
+wire [31:0]                                     commit_buffer_error_count;
+
 // --------------------------------------------------------------
 //                 Consensus Core
 // --------------------------------------------------------------
 
 wire [63:0] current_run_id;
 wire [63:0] current_round_id;
-wire [63:0] current_slot_id;
 
 wire system_halt;
-
-assign current_slot_id = current_round_id;
 
 // --------------------------------------------------------------
 //                  Register block logic
@@ -679,29 +712,8 @@ always @(posedge clk) begin
 end
 
 // ==============================================================
-//                      SSR CORE LOGIC
-// ==============================================================
-
-
-// ==============================================================
 //                          TX datapath
 // ==============================================================
-
-wire                            proposal_tail_slot_valid;
-wire [RAM_ADDR_WIDTH-1:0]       proposal_tail_slot_addr;
-wire [DMA_LEN_WIDTH-1:0]        proposal_tail_slot_len;
-
-wire proposal_tail_commit_valid;
-wire proposal_tail_commit_ready;
-
-// proposal -> tx_engine/sink
-wire [RAM_SEG_COUNT*RAM_SEG_DATA_WIDTH-1:0]     proposal_buf_rd_data;
-wire [RAM_SEG_COUNT*RAM_SEG_BE_WIDTH-1:0]       proposal_buf_rd_be;
-wire                                            proposal_buf_rd_valid;
-wire                                            proposal_buf_rd_ready;
-wire                                            proposal_buf_tx_last;
-wire [DMA_LEN_WIDTH-1:0]                        proposal_buf_tx_len;
-
 consensus_tx #(
     .P_DATA_WIDTH(AXIS_IF_DATA_WIDTH),
     .P_KEEP_WIDTH(AXIS_IF_KEEP_WIDTH),
@@ -720,12 +732,13 @@ consensus_tx #(
     .buf_rd_ready(proposal_buf_rd_ready),
     .buf_tx_last(proposal_buf_tx_last),
     .buf_tx_len(proposal_buf_tx_len),
+    .buf_empty(proposal_buf_empty),
 
     .i_tx_allowed(tx_allowed),
-    .i_current_slot_id(current_slot_id),
+    .i_current_round_id(current_round_id),
     .i_current_run_id(current_run_id),
     .i_knowledge_vec(tx_knowledge_vec),
-    .o_tx_start(),
+    .i_halt(system_halt),
 
     .m_axis_tdata(axis_cons_tx_tdata),
     .m_axis_tkeep(axis_cons_tx_tkeep),
@@ -897,65 +910,13 @@ proposal_buffer_inst (
     .buf_rd_valid(proposal_buf_rd_valid),
     .buf_rd_ready(proposal_buf_rd_ready),
     .buf_tx_last(proposal_buf_tx_last),
-    .buf_tx_len(proposal_buf_tx_len)
+    .buf_tx_len(proposal_buf_tx_len),
+    .buf_empty(proposal_buf_empty)
 );
-
-
-// -------------------------------------------------
-//     instance of proposal buffer sink
-// -------------------------------------------------
-// proposal_buffer_sink #(
-//     .DMA_LEN_WIDTH(DMA_LEN_WIDTH),
-
-//     .RAM_SEG_COUNT(RAM_SEG_COUNT),
-//     .RAM_SEG_DATA_WIDTH(RAM_SEG_DATA_WIDTH),
-//     .RAM_SEG_BE_WIDTH(RAM_SEG_BE_WIDTH),
-
-//     .PROPOSAL_SLOT_BYTES(PROPOSAL_SLOT_BYTES)
-// )
-// proposal_buffer_sink_inst (
-//     .clk(clk),
-//     .rst(rst),
-
-//     // read interface from proposal buffer
-//     .buf_rd_data(proposal_buf_rd_data),
-//     .buf_rd_be(proposal_buf_rd_be),
-//     .buf_rd_valid(proposal_buf_rd_valid),
-//     .buf_rd_ready(proposal_buf_rd_ready),
-//     .buf_tx_last(proposal_buf_tx_last),
-//     .buf_tx_len(proposal_buf_tx_len),
-
-//     // Control/status outputs
-//     .sink_enable(proposal_sink_enable),
-//     .sink_clear(proposal_sink_clear),
-
-//     .sink_slot_count(proposal_sink_slot_count),
-//     .sink_beat_count(proposal_sink_beat_count),
-//     .sink_error_count(proposal_sink_error_count)
-// );
 
 // ==============================================================
 //                          RX datapath
 // ==============================================================
-assign reg_wr_ack_commit_queue = reg_wr_en_commit_queue; // acknowledge immediately, no wait states
-
-assign reg_rd_ack_commit_queue = reg_rd_en_commit_queue; // acknowledge immediately, no wait states
-assign reg_rd_data_commit_queue = 0; // no data to return for commit queue
-
-wire [RAM_SEG_COUNT*RAM_SEG_DATA_WIDTH-1:0]     commit_in_data;
-wire [RAM_SEG_COUNT*RAM_SEG_BE_WIDTH-1:0]       commit_in_be;
-wire                                            commit_in_valid;
-wire                                            commit_in_ready;
-wire                                            commit_in_last;
-
-wire                                            commit_head_slot_valid;
-wire [RAM_ADDR_WIDTH-1:0]                       commit_head_slot_addr;
-wire [DMA_LEN_WIDTH-1:0]                        commit_head_slot_len;
-
-wire                                            commit_head_slot_pop_valid;
-wire                                            commit_head_slot_pop_ready;
-
-wire [31:0]                                     commit_buffer_error_count;
 
 commit_buffer #(
     .DMA_LEN_WIDTH(DMA_LEN_WIDTH),
@@ -1075,8 +1036,9 @@ consensus_rx #(
     .rst(rst),
 
     .i_rx_enabled(rx_enabled),
-    .i_current_round_id(current_slot_id),
+    .i_current_round_id(current_round_id),
     .i_current_run_id(current_run_id),
+    .i_halt(system_halt),
 
     .commit_in_data(commit_in_data),
     .commit_in_be(commit_in_be),
@@ -1138,9 +1100,9 @@ consensus_rx_splitter #(
     .m_axis_cons_rx_tready(axis_cons_rx_tready)
 );
 
-// --------------------------------------------------------------
-//                 Consensus Core
-// --------------------------------------------------------------
+// ==============================================================
+//                      SSR CORE LOGIC
+// ==============================================================
 consensus_core #(
     .P_NODE_COUNT(P_NODE_COUNT),
     .P_NODE_ID(P_NODE_ID),

@@ -16,7 +16,9 @@ module consensus_rx #(
     parameter RAM_SEG_DATA_WIDTH = 256*2/RAM_SEG_COUNT,
     parameter RAM_SEG_BE_WIDTH = RAM_SEG_DATA_WIDTH/8,
 
-    parameter COMMIT_SLOT_BYTES = 1024
+    parameter COMMIT_SLOT_BYTES = 1024,
+    parameter MAX_COMMITS_PER_ROUND = 10, // need to do actual math to calculate this
+    parameter LOG_MAX_COMMITS = $clog2(MAX_COMMITS_PER_ROUND)
 ) (
     // clock and reset
     input wire                          clk,
@@ -26,6 +28,7 @@ module consensus_rx #(
     input wire                          i_rx_enabled,
     input wire [63:0]                   i_current_run_id,
     input wire [63:0]                   i_current_round_id,
+    input wire                          i_halt,
 
     // Commit stream output to commit_buffer
     output reg [RAM_SEG_COUNT*RAM_SEG_DATA_WIDTH-1:0]       commit_in_data,
@@ -77,6 +80,14 @@ localparam integer DATA_WORD_COUNT =
 localparam [RAM_SEG_COUNT*RAM_SEG_BE_WIDTH-1:0] FULL_BE =
     {RAM_SEG_COUNT*RAM_SEG_BE_WIDTH{1'b1}};
 
+// states
+localparam S_IDLE = 2'b00;
+localparam S_RECEIVE = 2'b01;
+localparam S_COMMIT = 2'b10;
+localparam S_HALT = 2'b11;
+
+reg [1:0] state;
+
 //------------------------------------------------
 //         Packet Parsing Logic
 //------------------------------------------------
@@ -90,7 +101,7 @@ function [63:0] swap64(input [63:0] in);
                in[39:32], in[47:40], in[55:48], in[63:56]};
 endfunction
 
-// Feilds
+// Fields
 wire [15:0] w_ethertype_net = s_axis_tdata[111:96];
 wire [15:0] w_ethertype =   swap16(w_ethertype_net);
 
@@ -135,11 +146,24 @@ always @(*) begin // consensus core checks round and run ID
     end
 end
 
-reg [7:0] prev_node;
-reg [63:0] prev_round_id;
-wire new_packet;
+// round boundary logic
 
-assign new_packet = (prev_node != w_rx_node_id) ? 1'b1 : (prev_round_id != w_rx_round_id ? 1'b1 : 1'b0);
+reg [63:0] prev_round_id;
+
+wire new_round_pulse;
+reg new_round_pulse_delayed;
+
+assign new_round_pulse = (i_current_round_id != prev_round_id);
+
+// payload matrix to store payloads from each node in the current round
+
+reg [RAM_SEG_DATA_WIDTH-1:0] payload_matrix [0:P_NODE_COUNT-1] [0:MAX_COMMITS_PER_ROUND-1];
+reg [RAM_SEG_DATA_WIDTH-1:0] payload_matrix_to_buffer [0:P_NODE_COUNT-1] [0:MAX_COMMITS_PER_ROUND-1];
+
+reg [LOG_MAX_COMMITS-1:0] commit_count_per_node [0:P_NODE_COUNT-1];
+reg [LOG_MAX_COMMITS-1:0] commit_count_per_node_to_buffer [0:P_NODE_COUNT-1];
+
+reg [P_NODE_COUNT-1:0] committed_node_tracker;
 
 //------------------------------------------------
 //         Output Logic
@@ -149,55 +173,140 @@ always @(posedge clk) begin
         o_rx_valid <= 0;
         o_rx_node_id <= 0;
         o_rx_sound_bitmap <= 0;
-        commit_in_data <= 0;
-        commit_in_be <= 0;
         o_rx_run_id <= 0;
         o_rx_round_id <= 0;
+
+        commit_in_data <= 0;
+        commit_in_be <= 0;
         commit_in_valid <= 0;
         commit_in_last <= 0;
-        prev_node <= {8{1'b1}};
-        prev_round_id <= {64{1'b1}};
+        
+        prev_round_id <= 0;
+        new_round_pulse_delayed <= 0;
+        committed_node_tracker <= 0;
     end else if (!i_rx_enabled) begin
         o_rx_valid <= 0;
         o_rx_node_id <= 0;
         o_rx_sound_bitmap <= 0;
-        commit_in_data <= 0;
-        commit_in_be <= 0;
         o_rx_run_id <= 0;
         o_rx_round_id <= 0;
+        
+        commit_in_data <= 0;
+        commit_in_be <= 0;
         commit_in_valid <= 0;
         commit_in_last <= 0;
-        prev_node <= {8{1'b1}};
-        prev_round_id <= {64{1'b1}};
+        prev_round_id <= 0;
+        
+        new_round_pulse_delayed <= 0;
+        committed_node_tracker <= 0;
     end else begin
-        o_rx_valid <= r_packet_valid;
-        if (r_packet_valid) begin
-            o_rx_node_id <= w_rx_node_id;
-            o_rx_sound_bitmap <= w_rx_knowledge_vec;
-            o_rx_run_id <= w_rx_run_id;
-            o_rx_round_id <= w_rx_round_id;
-        end else begin
-            o_rx_node_id <= 0;
-            o_rx_sound_bitmap <= 0;
-            o_rx_run_id <= 0;
-            o_rx_round_id <= 0;
-        end
+        prev_round_id <= i_current_round_id;
+        new_round_pulse_delayed <= new_round_pulse;
 
-        if (commit_in_ready && r_packet_valid && new_packet) begin
-            commit_in_data <= w_rx_payload;
-            commit_in_be <= FULL_BE;
-            commit_in_last <= 1;
-            commit_in_valid <= r_packet_valid;
-            prev_node <= w_rx_node_id;
-            prev_round_id <= w_rx_round_id;
-        end else begin
-            commit_in_data <= 0;
-            commit_in_be <= 0;
-            commit_in_valid <= 0;
-            commit_in_last <= 0;
-            prev_node <= prev_node;
-            prev_round_id <= prev_round_id;
-        end
+        case (state)
+            S_IDLE: begin
+                if (i_rx_enabled) begin
+                    state <= S_RECEIVE;
+                end
+                o_rx_node_id <= 0;
+                o_rx_sound_bitmap <= 0;
+                o_rx_run_id <= 0;
+                o_rx_round_id <= 0;
+            end
+
+            S_RECEIVE: begin
+                if (new_round_pulse_delayed) begin
+                    state <= S_COMMIT;
+                    payload_matrix_to_buffer <= payload_matrix;
+                    commit_count_per_node_to_buffer <= commit_count_per_node;
+                    // reset commit counts for the new round
+                    payload_matrix <= '{default: '{default: 0}};
+                    commit_count_per_node <= '{default: 0};
+                    o_rx_node_id <= 0;
+                    o_rx_sound_bitmap <= 0;
+                    o_rx_run_id <= 0;
+                    o_rx_round_id <= 0;
+                    o_rx_valid <= 0;
+                end else begin
+                    if (r_packet_valid) begin
+                        o_rx_node_id <= w_rx_node_id;
+                        o_rx_sound_bitmap <= w_rx_knowledge_vec[P_NODE_COUNT-1:0];
+                        o_rx_run_id <= w_rx_run_id[31:0];
+                        o_rx_round_id <= w_rx_round_id[31:0];
+                        o_rx_valid <= 1;
+
+                        if (commit_count_per_node[w_rx_node_id] == 0) begin
+                            payload_matrix[w_rx_node_id][0] <= w_rx_payload;
+                            commit_count_per_node[w_rx_node_id] <= 1;
+                        end else if ((commit_count_per_node[w_rx_node_id] < MAX_COMMITS_PER_ROUND) && (payload_matrix[w_rx_node_id][(commit_count_per_node[w_rx_node_id] - 1)] != w_rx_payload)) begin
+                            payload_matrix[w_rx_node_id][commit_count_per_node[w_rx_node_id]] <= w_rx_payload;
+                            commit_count_per_node[w_rx_node_id] <= commit_count_per_node[w_rx_node_id] + 1;
+                        end // else begin
+                        //     payload_matrix[w_rx_node_id][commit_count_per_node[w_rx_node_id]] <= payload_matrix[w_rx_node_id][commit_count_per_node[w_rx_node_id]];
+                        //    commit_count_per_node[w_rx_node_id] <= commit_count_per_node[w_rx_node_id];
+                        // end
+
+                    end else begin
+                        o_rx_node_id <= 0;
+                        o_rx_sound_bitmap <= 0;
+                        o_rx_run_id <= 0;
+                        o_rx_round_id <= 0;
+                        o_rx_valid <= 0;
+                    end
+                end
+            end
+
+            S_COMMIT: begin
+                if (i_halt) begin
+                    state <= S_HALT;
+                end else begin
+                    if (commit_count_per_node_to_buffer[committed_node_tracker] > 0 && committed_node_tracker != P_NODE_ID) begin
+                        if (commit_in_ready) begin
+                            commit_in_data <= payload_matrix_to_buffer[committed_node_tracker][0];
+                            commit_in_be <= FULL_BE;
+                            commit_in_last <= 1;
+                            commit_in_valid <= 1;
+                            // Shift the payloads for the current node to the left
+                            for (int i = 0; i < MAX_COMMITS_PER_ROUND - 1; i++) begin
+                                payload_matrix_to_buffer[committed_node_tracker][i] <= payload_matrix_to_buffer[committed_node_tracker][i + 1];
+                            end
+                            // Decrement the commit count for the current node
+                            commit_count_per_node_to_buffer[committed_node_tracker] <= commit_count_per_node_to_buffer[committed_node_tracker] - 1;
+                        end else begin
+                            commit_in_data <= 0;
+                            commit_in_be <= 0;
+                            commit_in_valid <= 0;
+                            commit_in_last <= 0;
+                        end
+                    end else begin
+                        // Move to the next node
+                        committed_node_tracker <= committed_node_tracker + 1;
+                        if (committed_node_tracker == P_NODE_COUNT - 1) begin
+                            state <= S_IDLE; // All nodes processed, go back to idle
+                        end
+                    end
+                end
+
+            end
+
+            S_HALT: begin
+                o_rx_node_id <= 0;
+                o_rx_sound_bitmap <= 0;
+                o_rx_run_id <= 0;
+                o_rx_round_id <= 0;
+                o_rx_valid <= 0;
+
+                commit_in_data <= 0;
+                commit_in_be <= 0;
+                commit_in_valid <= 0;
+                commit_in_last <= 0;
+            end
+
+            default: begin
+                state <= S_IDLE;
+            end
+
+        endcase     
     end
 end
 

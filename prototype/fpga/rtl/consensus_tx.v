@@ -29,13 +29,14 @@ module consensus_tx #(
     output reg                                          buf_rd_ready,
     input wire                                          buf_tx_last,
     input wire [DMA_LEN_WIDTH-1:0]                      buf_tx_len,
+    input wire                                          buf_empty, 
 
     // Control and Data
     input wire                              i_tx_allowed,
-    input wire [63:0]                       i_current_slot_id,
+    input wire [63:0]                       i_current_round_id,
     input wire [63:0]                       i_current_run_id,
     input wire [P_NODE_COUNT-1:0]           i_knowledge_vec,
-    output reg                              o_tx_start,
+    input wire                              i_halt,
 
     // AXI Stream Master Output
     output reg [P_DATA_WIDTH-1:0]           m_axis_tdata,
@@ -70,16 +71,14 @@ endfunction
 //------------------------------------------------
 localparam S_IDLE                 = 3'b00;
 localparam S_BROADCAST_START      = 3'b01;
-localparam S_BROADCAST_WAIT       = 3'b10;
-localparam S_BROADCAST_SEND       = 3'b11;
-localparam S_BROADCAST_NO_PROPOSAL  = 3'b100;
+localparam S_BROADCAST_SEND       = 3'b10;
+localparam S_BROADCAST_WAIT       = 3'b11;
+localparam S_HALT                 = 3'b100;
 
 reg [2:0] state;
 reg [7:0]   r_target_node_id;
 
-reg last_packet_reached;
-wire next_last_packet_reached;
-assign next_last_packet_reached = buf_tx_last ? 1'b1 : last_packet_reached;
+reg [RAM_SEG_COUNT*RAM_SEG_DATA_WIDTH-1:0] current_payload;
 
 reg last_tx_allowed;
 wire tx_allowed_pulse = i_tx_allowed && !last_tx_allowed; // Detect rising edge of tx_allowed
@@ -142,19 +141,17 @@ always @(*) begin
     v_packet_flit[14*8 +: 64]  = to_big_endian_64(i_current_run_id);
     v_packet_flit[22*8 +: P_NODE_COUNT]   = i_knowledge_vec;
     v_packet_flit[23*8 +: 8]   = P_NODE_ID[7:0];
-    v_packet_flit[24*8 +: 64]  = to_big_endian_64(i_current_slot_id);
+    v_packet_flit[24*8 +: 64]  = to_big_endian_64(i_current_round_id);
 
     // ------- Payload -------
-    v_packet_flit[32*8 +: P_LOG_ITEM_LEN*8] = buf_rd_valid ?
+    v_packet_flit[32*8 +: P_LOG_ITEM_LEN*8] = 
     {
-        to_big_endian_64(buf_rd_data[63:0]),
-        to_big_endian_64(buf_rd_data[127:64]),
-        to_big_endian_64(buf_rd_data[191:128]),
-        to_big_endian_64(buf_rd_data[255:192])
-    } : 0; // not sure if this is right, but doing this to be consistent with rx side parsing
+        to_big_endian_64(current_payload[63:0]),
+        to_big_endian_64(current_payload[127:64]),
+        to_big_endian_64(current_payload[191:128]),
+        to_big_endian_64(current_payload[255:192])
+    }; // not sure if this is right, but doing this to be consistent with rx side parsing
 end
-
-assign o_tx_start = (state == S_IDLE) && tx_allowed_pulse;
 
 // Debug Parameters
 
@@ -211,7 +208,6 @@ always @(posedge clk) begin
         r_target_node_id <= 8'b0;
         last_tx_allowed <= 1'b0;
         buf_rd_ready <= 1'b0;
-        last_packet_reached <= 1'b0;
     end else begin
         last_tx_allowed <= i_tx_allowed;
 
@@ -225,20 +221,19 @@ always @(posedge clk) begin
                 m_axis_tuser <= 1'b0;
                 m_axis_tid <= 8'b0; // Use target node ID as TID
                 m_axis_tdest <= 8'b0; // Use target node ID as DEST
-                last_packet_reached <= 1'b0;
                 nodes_completed_reg <= 8'b0;
                 
                 r_target_node_id <= 0;
                 buf_rd_ready <= 1'b0;
+                current_payload <= {RAM_SEG_COUNT*RAM_SEG_DATA_WIDTH{1'b0}};
 
-                if (tx_allowed_pulse) begin
+                if (tx_allowed_pulse && !i_halt) begin
                     // Start broadcasting to all nodes
                     state <= S_BROADCAST_START;
                 end
             end
 
             S_BROADCAST_START: begin
-                buf_rd_ready <= 1'b0;
                 if (!i_tx_allowed) begin
                     state <= S_IDLE; // Abort if not allowed
                     m_axis_tdata <= {P_DATA_WIDTH{1'b0}};
@@ -248,36 +243,17 @@ always @(posedge clk) begin
                     m_axis_tuser <= 1'b0;
                     m_axis_tid <= 8'b0;
                     m_axis_tdest <= 8'b0;
-                    last_packet_reached <= 1'b0;
+                    buf_rd_ready <= 1'b0;
                 end
                 else begin
-                    state <= S_BROADCAST_WAIT;
-                end
-            end
+                    buf_rd_ready <= 1'b1;
+                    current_payload <= buf_rd_valid ? buf_rd_data : current_payload;
 
-            S_BROADCAST_WAIT: begin
-                if (!i_tx_allowed) begin
-                    state <= S_IDLE; // Abort if not allowed
-                    m_axis_tdata <= {P_DATA_WIDTH{1'b0}};
-                    m_axis_tkeep <= {P_KEEP_WIDTH{1'b0}};
-                    m_axis_tvalid <= 1'b0;
-                    m_axis_tlast <= 1'b0;
-                    m_axis_tuser <= 1'b0;
-                    m_axis_tid <= 8'b0;
-                    m_axis_tdest <= 8'b0;
-                    last_packet_reached <= 1'b0;
-                    buf_rd_ready <= 1'b0;
-                end else if (m_axis_tready && buf_rd_valid) begin
-                    if (r_target_node_id != P_NODE_ID && (i_knowledge_vec[r_target_node_id])) begin
-                        buf_rd_ready <= 1'b1;                
-                    end else begin
-                        buf_rd_ready <= 1'b0;
-                    end
-                    
                     state <= S_BROADCAST_SEND;
                 end
             end
 
+            
             S_BROADCAST_SEND: begin
                 buf_rd_ready <= 1'b0;
                 if (!i_tx_allowed) begin
@@ -289,8 +265,8 @@ always @(posedge clk) begin
                     m_axis_tuser <= 1'b0;
                     m_axis_tid <= 8'b0;
                     m_axis_tdest <= 8'b0;
-                    last_packet_reached <= 1'b0;
-                end else begin
+                    current_payload <= {RAM_SEG_COUNT*RAM_SEG_DATA_WIDTH{1'b0}};
+                end else if (m_axis_tready) begin
                     if (r_target_node_id != P_NODE_ID && (i_knowledge_vec[r_target_node_id])) begin
                         m_axis_tdata <= v_packet_flit;
                         m_axis_tkeep <= {P_KEEP_WIDTH{1'b1}}; // All bytes valid
@@ -309,36 +285,27 @@ always @(posedge clk) begin
                         m_axis_tdest <= 8'b0;
                     end
 
-
                     if (r_target_node_id + 1 == P_NODE_COUNT || ((nodes_completed_reg + 1) == knowledge_count && r_target_node_id != P_NODE_ID && (i_knowledge_vec[r_target_node_id]))) begin
                         // Finished broadcasting
-                        state <= S_IDLE;
+                        state <= S_BROADCAST_WAIT;
                         r_target_node_id <= 0;
-                        // m_axis_tlast <= 1'b1; // Last flit for this transmission
                     end else if ((r_target_node_id + 1) == P_NODE_ID && P_NODE_ID + 1 < P_NODE_COUNT) begin
                         // Skip self node
                         r_target_node_id <= r_target_node_id + 2;
-                        state <= S_BROADCAST_WAIT;
-                        // m_axis_tlast <= 1'b0;
+                        state <= S_BROADCAST_SEND;
                     end else if ((r_target_node_id + 1) == P_NODE_ID && P_NODE_ID + 1 == P_NODE_COUNT) begin
                         // Skip self node and finish broadcasting
-                        state <= S_IDLE;
-                        // m_axis_tlast <= 1'b1; // Last flit for this transmission
+                        state <= S_BROADCAST_WAIT;
                         r_target_node_id <= 0;
-                    end else if (buf_tx_last && r_target_node_id + 1 < P_NODE_COUNT) begin
-                        r_target_node_id <= r_target_node_id + 1;
-                        state <= S_BROADCAST_NO_PROPOSAL;
-                        // m_axis_tlast <= 1'b0;
                     end else begin
                         // Wait for the next cycle to send the next packet
                         r_target_node_id <= r_target_node_id + 1;
-                        state <= S_BROADCAST_WAIT;
-                        // m_axis_tlast <= 1'b0;
+                        state <= S_BROADCAST_SEND;
                     end
                 end
             end
 
-            S_BROADCAST_NO_PROPOSAL: begin
+            S_BROADCAST_WAIT: begin
                 if (!i_tx_allowed) begin
                     state <= S_IDLE; // Abort if not allowed
                     m_axis_tdata <= {P_DATA_WIDTH{1'b0}};
@@ -349,40 +316,23 @@ always @(posedge clk) begin
                     m_axis_tid <= 8'b0;
                     m_axis_tdest <= 8'b0;
                     buf_rd_ready <= 1'b0;
-                    last_packet_reached <= 1'b0;
-                end else if (m_axis_tready) begin
-                    if (r_target_node_id != P_NODE_ID && (i_knowledge_vec[r_target_node_id])) begin
-                        m_axis_tdata <= 0;
-                        m_axis_tkeep <= {P_KEEP_WIDTH{1'b1}}; // All bytes valid
-                        m_axis_tuser <= P_NODE_ID;
-                        m_axis_tid <= P_NODE_ID;
-                        m_axis_tdest <= r_target_node_id[3:0];
-                        nodes_completed_reg <= nodes_completed_reg + 1;
-                    end
-
-                    if (r_target_node_id + 1 == P_NODE_COUNT || (nodes_completed_reg + 1) == knowledge_count) begin
-                        // Finished broadcasting
-                        state <= S_IDLE;
-                        r_target_node_id <= 0;
-                        m_axis_tlast <= 1'b1;
-                    end else if ((r_target_node_id + 1) == P_NODE_ID && P_NODE_ID + 1 < P_NODE_COUNT) begin
-                        // Skip self node
-                        state <= S_BROADCAST_NO_PROPOSAL;
-                        r_target_node_id <= r_target_node_id + 2;
-                        m_axis_tlast <= 1'b0;
-                    end else if ((r_target_node_id + 1) == P_NODE_ID && P_NODE_ID + 1 == P_NODE_COUNT) begin
-                        // Skip self node and finish broadcasting
-                        state <= S_IDLE;
-                        r_target_node_id <= 0;
-                        m_axis_tlast <= 1'b1;
-                    end else begin
-                        // Wait for the next cycle to send the next packet
-                        r_target_node_id <= r_target_node_id + 1;
-                        state <= S_BROADCAST_NO_PROPOSAL;
-                        m_axis_tlast <= 1'b0;
-                    end
+                end else if (buf_rd_valid) begin
+                    state <= S_BROADCAST_SEND;
+                    current_payload <= buf_rd_data;
+                    buf_rd_ready <= 1'b1;
+                end else if (buf_empty) begin
+                    state <= S_IDLE; // No more data to send
+                    m_axis_tdata <= {P_DATA_WIDTH{1'b0}};
+                    m_axis_tkeep <= {P_KEEP_WIDTH{1'b0}};
+                    m_axis_tvalid <= 1'b0;
+                    m_axis_tlast <= 1'b0;
+                    m_axis_tuser <= 1'b0;
+                    m_axis_tid <= 8'b0;
+                    m_axis_tdest <= 8'b0;
+                    buf_rd_ready <= 1'b0;
                 end
             end
+
             default: state <= S_IDLE;
         endcase
     end 

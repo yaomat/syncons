@@ -65,7 +65,8 @@ module proposal_buffer #
     output wire                                             buf_rd_valid,    
     input  wire                                             buf_rd_ready,
     output wire                                             buf_tx_last,
-    output wire [DMA_LEN_WIDTH-1:0]                         buf_tx_len
+    output wire [DMA_LEN_WIDTH-1:0]                         buf_tx_len,
+    output wire                                             buf_empty
 );
 
 localparam [RAM_SEL_WIDTH-1:0] RAM_SEL_PROP_VALUE = RAM_SEL_PROP;
@@ -182,6 +183,7 @@ wire ram_rd_resp_fire;
 // ==============================================================================
 assign buffer_empty = slot_count_reg == {SLOT_COUNT_WIDTH{1'b0}};
 assign buffer_full = slot_count_reg == PROPOSAL_SLOT_COUNT_VALUE;
+assign buf_empty = buffer_empty;
 
 assign tx_head_slot_ram_addr    = head_ptr_reg * PROPOSAL_SLOT_BEAT_COUNT;
 assign tx_current_rd_addr       = tx_head_slot_ram_addr + tx_beat_index_reg;
